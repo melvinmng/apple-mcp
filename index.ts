@@ -82,31 +82,6 @@ type ToolName =
 	| "search"
 	| "fetch";
 
-const TOOL_DESCRIPTIONS: Record<ToolName, string> = {
-	contacts: "Search and retrieve contacts from Apple Contacts app",
-	notes: "Search, retrieve and create notes in Apple Notes app",
-	messages:
-		"Interact with Apple Messages app - send, read, schedule messages and check unread messages",
-	mail: "Interact with Apple Mail app - read unread emails, search emails, and send emails",
-	reminders: "Search, create, and open reminders in Apple Reminders app",
-	calendar: "Search, create, and open calendar events in Apple Calendar app",
-	maps: "Search locations, manage guides, save favorites, and get directions using Apple Maps",
-	search: "Search Apple MCP documentation for relevant guidance and capabilities",
-	fetch: "Fetch the full contents of an Apple MCP documentation search result",
-};
-
-const TOOL_NAMES: ToolName[] = [
-	"contacts",
-	"notes",
-	"messages",
-	"mail",
-	"reminders",
-	"calendar",
-	"maps",
-	"search",
-	"fetch",
-];
-
 const ContactsArgsSchema = z
 	.object({
 		name: z
@@ -231,16 +206,51 @@ const FetchArgsSchema = z
 	})
 	.passthrough();
 
-const TOOL_SCHEMAS: Record<ToolName, z.ZodObject<any>> = {
-	contacts: ContactsArgsSchema,
-	notes: NotesArgsSchema,
-	messages: MessagesArgsSchema,
-	mail: MailArgsSchema,
-	reminders: RemindersArgsSchema,
-	calendar: CalendarArgsSchema,
-	maps: MapsArgsSchema,
-	search: SearchArgsSchema,
-	fetch: FetchArgsSchema,
+const TOOL_CONFIG: Record<
+	ToolName,
+	{ description: string; schema: z.ZodObject<any> }
+> = {
+	contacts: {
+		description: "Search and retrieve contacts from Apple Contacts app",
+		schema: ContactsArgsSchema,
+	},
+	notes: {
+		description: "Search, retrieve and create notes in Apple Notes app",
+		schema: NotesArgsSchema,
+	},
+	messages: {
+		description:
+			"Interact with Apple Messages app - send, read, schedule messages and check unread messages",
+		schema: MessagesArgsSchema,
+	},
+	mail: {
+		description:
+			"Interact with Apple Mail app - read unread emails, search emails, and send emails",
+		schema: MailArgsSchema,
+	},
+	reminders: {
+		description: "Search, create, and open reminders in Apple Reminders app",
+		schema: RemindersArgsSchema,
+	},
+	calendar: {
+		description: "Search, create, and open calendar events in Apple Calendar app",
+		schema: CalendarArgsSchema,
+	},
+	maps: {
+		description:
+			"Search locations, manage guides, save favorites, and get directions using Apple Maps",
+		schema: MapsArgsSchema,
+	},
+	search: {
+		description:
+			"Search Apple MCP documentation for relevant guidance and capabilities",
+		schema: SearchArgsSchema,
+	},
+	fetch: {
+		description:
+			"Fetch the full contents of an Apple MCP documentation search result",
+		schema: FetchArgsSchema,
+	},
 };
 
 function registerTool(
@@ -419,8 +429,11 @@ function createMcpServer(): McpServer {
 		},
 	);
 
-	for (const name of TOOL_NAMES) {
-		registerTool(server, name, TOOL_DESCRIPTIONS[name], TOOL_SCHEMAS[name]);
+	for (const [name, config] of Object.entries(TOOL_CONFIG) as Array<[
+		ToolName,
+		{ description: string; schema: z.ZodObject<any> },
+	]>) {
+		registerTool(server, name, config.description, config.schema);
 	}
 
 	return server;

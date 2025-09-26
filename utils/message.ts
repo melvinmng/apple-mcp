@@ -15,6 +15,8 @@ const CONFIG = {
     TIMEOUT_MS: 8000
 };
 
+const APPLESCRIPT_TIMEOUT_SECONDS = Math.max(1, Math.ceil(CONFIG.TIMEOUT_MS / 1000));
+
 // Retry configuration
 const MAX_RETRIES = 3;
 const RETRY_DELAY = 1000; // 1 second
@@ -69,15 +71,37 @@ function normalizePhoneNumber(phone: string): string[] {
     return Array.from(formats);
 }
 
+function sanitizePhoneNumber(phoneNumber: string): string {
+    // Messages expects numbers without spaces or formatting
+    const normalized = phoneNumber.replace(/[^0-9+]/g, "");
+    if (normalized.startsWith("+")) {
+        return normalized;
+    }
+    if (normalized.length === 11 && normalized.startsWith("1")) {
+        return `+${normalized}`;
+    }
+    if (normalized.length === 10) {
+        return `+1${normalized}`;
+    }
+    return normalized;
+}
+
 async function sendMessage(phoneNumber: string, message: string) {
-    const escapedMessage = message.replace(/"/g, '\\"');
-    const result = await runAppleScript(`
-tell application "Messages"
-    set targetService to 1st service whose service type = iMessage
-    set targetBuddy to buddy "${phoneNumber}"
-    send "${escapedMessage}" to targetBuddy
-end tell`);
-    return result;
+    const sanitizedNumber = sanitizePhoneNumber(phoneNumber);
+    const script = `
+with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
+        tell application "Messages"
+        set targetService to first service whose service type = iMessage
+        try
+            set targetBuddy to buddy ${JSON.stringify(sanitizedNumber)} of targetService
+        on error
+            set targetBuddy to make new buddy with service targetService with properties {handle:${JSON.stringify(sanitizedNumber)}}
+        end try
+        send ${JSON.stringify(message)} to targetBuddy
+    end tell
+end timeout`;
+
+    return runAppleScript(script);
 }
 
 interface Message {
