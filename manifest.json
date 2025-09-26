@@ -62,6 +62,14 @@
 		{
 			"name": "maps",
 			"description": "Search locations, manage guides, save favorites, and get directions using Apple Maps"
+		},
+		{
+			"name": "search",
+			"description": "Search Apple MCP documentation for relevant guidance and capabilities"
+		},
+		{
+			"name": "fetch",
+			"description": "Fetch the full contents of an Apple MCP documentation search result"
 		}
 	],
 	"compatibility": {

@@ -291,6 +291,36 @@ const MAPS_TOOL: Tool = {
   }
 };
 
-const tools = [CONTACTS_TOOL, NOTES_TOOL, MESSAGES_TOOL, MAIL_TOOL, REMINDERS_TOOL, CALENDAR_TOOL, MAPS_TOOL];
+const SEARCH_TOOL: Tool = {
+  name: "search",
+  description: "Search Apple MCP documentation for relevant guidance and capabilities",
+  inputSchema: {
+    type: "object",
+    properties: {
+      query: {
+        type: "string",
+        description: "Search query to find relevant documentation"
+      }
+    },
+    required: ["query"]
+  }
+};
+
+const FETCH_TOOL: Tool = {
+  name: "fetch",
+  description: "Fetch the full contents of an Apple MCP documentation search result",
+  inputSchema: {
+    type: "object",
+    properties: {
+      id: {
+        type: "string",
+        description: "Identifier of the search result returned by the search tool"
+      }
+    },
+    required: ["id"]
+  }
+};
+
+const tools = [CONTACTS_TOOL, NOTES_TOOL, MESSAGES_TOOL, MAIL_TOOL, REMINDERS_TOOL, CALENDAR_TOOL, MAPS_TOOL, SEARCH_TOOL, FETCH_TOOL];
 
 export default tools;
