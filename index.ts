@@ -1,5 +1,8 @@
 #!/usr/bin/env node
+import http from "node:http";
+import { URL } from "node:url";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
+import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import {
 	CallToolRequestSchema,
@@ -15,6 +18,38 @@ let loadingTimeout: ReturnType<typeof setTimeout> | null = null;
 let safeModeFallback = false;
 
 console.error("Starting apple-mcp server...");
+
+type ServerMode = "stdio" | "http";
+
+type CliArgs = Record<string, string | boolean>;
+
+interface HttpServerConfig {
+	host: string;
+	port: number;
+	basePath: string;
+	corsOrigin: string;
+}
+
+const cliArgs = parseCliArgs(process.argv.slice(2));
+const serverMode: ServerMode = resolveServerMode(cliArgs);
+const httpConfig = resolveHttpConfig(cliArgs);
+
+console.error(`Server transport mode: ${serverMode.toUpperCase()}`);
+
+let serverStartPromise: Promise<void> | null = null;
+let activeHttpServer: http.Server | null = null;
+
+function requestShutdown() {
+	console.error("Received shutdown signal, closing server...");
+	if (activeHttpServer) {
+		activeHttpServer.close(() => process.exit(0));
+	} else {
+		process.exit(0);
+	}
+}
+
+process.once("SIGINT", requestShutdown);
+process.once("SIGTERM", requestShutdown);
 
 // Placeholders for modules - will either be loaded eagerly or lazily
 let contacts: typeof import("./utils/contacts").default | null = null;
@@ -101,7 +136,7 @@ loadingTimeout = setTimeout(() => {
 	calendar = null;
 
 	// Proceed with server setup
-	initServer();
+	void ensureServerStarted();
 }, 5000); // 5 second timeout
 
 // Eager loading attempt
@@ -139,7 +174,7 @@ async function attemptEagerLoading() {
 		}
 
 		console.error("All modules loaded successfully, using eager loading mode");
-		initServer();
+		void ensureServerStarted();
 	} catch (error) {
 		console.error("Error during eager loading:", error);
 		console.error("Switching to safe mode (lazy loading)...");
@@ -164,23 +199,21 @@ async function attemptEagerLoading() {
 		maps = null;
 
 		// Initialize the server in safe mode
-		initServer();
+		void ensureServerStarted();
 	}
 }
 
 // Attempt eager loading first
 attemptEagerLoading();
 
-// Main server object
-let server: Server;
 
 // Initialize the server and set up handlers
-function initServer() {
+function buildServer(): Server {
 	console.error(
 		`Initializing server in ${safeModeFallback ? "safe" : "standard"} mode...`,
 	);
 
-	server = new Server(
+	const server = new Server(
 		{
 			name: "Apple MCP tools",
 			version: "1.0.0",
@@ -1296,34 +1329,317 @@ end tell`;
 		}
 	});
 
-	// Start the server transport
-	console.error("Setting up MCP server transport...");
+	return server;
+}
 
-	(async () => {
-		try {
-			console.error("Initializing transport...");
-			const transport = new StdioServerTransport();
-
-			// Ensure stdout is only used for JSON messages
-			console.error("Setting up stdout filter...");
-			const originalStdoutWrite = process.stdout.write.bind(process.stdout);
-			process.stdout.write = (chunk: any, encoding?: any, callback?: any) => {
-				// Only allow JSON messages to pass through
-				if (typeof chunk === "string" && !chunk.startsWith("{")) {
-					console.error("Filtering non-JSON stdout message");
-					return true; // Silently skip non-JSON messages
-				}
-				return originalStdoutWrite(chunk, encoding, callback);
-			};
-
-			console.error("Connecting transport to server...");
-			await server.connect(transport);
-			console.error("Server connected successfully!");
-		} catch (error) {
-			console.error("Failed to initialize MCP server:", error);
+function ensureServerStarted(): Promise<void> {
+	if (!serverStartPromise) {
+		const startPromise = (async () => {
+			if (serverMode === "http") {
+				await startHttpServer();
+			} else {
+				await startStdioServer();
+			}
+		})();
+		serverStartPromise = startPromise;
+		startPromise.catch((error) => {
+			console.error("Fatal error while starting server transport:", error);
 			process.exit(1);
+		});
+	}
+	return serverStartPromise;
+}
+
+async function startStdioServer(): Promise<void> {
+	console.error("Setting up MCP server transport (STDIO)...");
+	const server = buildServer();
+	console.error("Initializing STDIO transport...");
+	const transport = new StdioServerTransport();
+
+	console.error("Setting up stdout filter...");
+	const originalStdoutWrite = process.stdout.write.bind(process.stdout);
+	process.stdout.write = (chunk: any, encoding?: any, callback?: any) => {
+		if (typeof chunk === "string" && !chunk.trim().startsWith("{")) {
+			console.error("Filtering non-JSON stdout message");
+			return true;
 		}
-	})();
+		return originalStdoutWrite(chunk, encoding, callback);
+	};
+
+	console.error("Connecting transport to server...");
+	await server.connect(transport);
+	console.error("Server connected successfully on STDIO!");
+}
+
+async function startHttpServer(): Promise<void> {
+	console.error("Setting up MCP server transport (HTTP/SSE)...");
+	const sessions = new Map<string, { server: Server; transport: SSEServerTransport }>();
+	const streamPath = httpConfig.basePath === "/" ? "/stream" : `${httpConfig.basePath}/stream`;
+	const messagePath = httpConfig.basePath === "/" ? "/message" : `${httpConfig.basePath}/message`;
+
+	await new Promise<void>((resolve, reject) => {
+		const server = http.createServer(async (req, res) => {
+			if (!req.url) {
+				res.writeHead(400, { "Content-Type": "text/plain" }).end("Missing request URL");
+				return;
+			}
+
+			const defaultHost = `${httpConfig.host}:${httpConfig.port}`;
+			const requestUrl = new URL(req.url, `http://${req.headers.host ?? defaultHost}`);
+			try {
+				if (req.method === "OPTIONS" && requestUrl.pathname.startsWith(httpConfig.basePath)) {
+					setCorsHeaders(res);
+					res.writeHead(204).end();
+					return;
+				}
+
+				if (req.method === "GET" && requestUrl.pathname === streamPath) {
+					setCorsHeaders(res);
+					const serverInstance = buildServer();
+					const transport = new SSEServerTransport(messagePath, res);
+					sessions.set(transport.sessionId, { server: serverInstance, transport });
+					transport.onclose = () => {
+						sessions.delete(transport.sessionId);
+						serverInstance.close().catch((error) => {
+							console.error(
+								`Error closing MCP session ${transport.sessionId}:`,
+								error,
+							);
+						});
+					};
+					transport.onerror = (error) => {
+						console.error(`Transport error for session ${transport.sessionId}:`, error);
+					};
+
+					try {
+						await serverInstance.connect(transport);
+						console.error(
+							`Established SSE session ${transport.sessionId} at ${requestUrl.origin}${messagePath}`,
+						);
+					} catch (error) {
+						console.error("Failed to establish SSE session:", error);
+						sessions.delete(transport.sessionId);
+						await transport.close().catch(() => undefined);
+						if (!res.headersSent) {
+							res.writeHead(500, { "Content-Type": "text/plain" }).end("Failed to start SSE session");
+						} else {
+							res.end();
+						}
+					}
+					return;
+				}
+
+				if (req.method === "POST" && requestUrl.pathname === messagePath) {
+					setCorsHeaders(res);
+					const sessionId =
+						requestUrl.searchParams.get("sessionId") ??
+						(typeof req.headers["x-session-id"] === "string"
+							? req.headers["x-session-id"]
+							: Array.isArray(req.headers["x-session-id"])
+								? req.headers["x-session-id"][0]
+								: undefined);
+
+					if (!sessionId) {
+						res.writeHead(400, { "Content-Type": "text/plain" }).end("Missing sessionId");
+						return;
+					}
+
+					const session = sessions.get(sessionId);
+					if (!session) {
+						res.writeHead(404, { "Content-Type": "text/plain" }).end("Unknown sessionId");
+						return;
+					}
+
+					try {
+						await session.transport.handlePostMessage(req, res);
+					} catch (error) {
+						console.error(`Error handling message for session ${sessionId}:`, error);
+						if (!res.headersSent) {
+							res.writeHead(500, { "Content-Type": "text/plain" }).end("Failed to handle message");
+						} else {
+							res.end();
+						}
+					}
+					return;
+				}
+
+				if (req.method === "GET" && requestUrl.pathname === httpConfig.basePath) {
+					setCorsHeaders(res);
+					res.writeHead(200, { "Content-Type": "application/json" }).end(
+						JSON.stringify({
+							message: "Apple MCP HTTP transport is running.",
+							sseEndpoint: streamPath,
+							postEndpoint: messagePath,
+						}),
+					);
+					return;
+				}
+
+				res
+					.writeHead(404, { "Content-Type": "text/plain" })
+					.end("Not Found");
+			} catch (error) {
+				console.error("Error handling HTTP request:", error);
+				if (!res.headersSent) {
+					res.writeHead(500, { "Content-Type": "text/plain" }).end("Internal Server Error");
+				} else {
+					res.end();
+				}
+			}
+		});
+
+		let settled = false;
+		server.once("error", (error) => {
+			console.error("HTTP server error:", error);
+			if (!settled) {
+				settled = true;
+				reject(error);
+			}
+		});
+
+		activeHttpServer = server;
+
+		server.listen(httpConfig.port, httpConfig.host, () => {
+			console.error(
+				`HTTP MCP server listening on http://${httpConfig.host}:${httpConfig.port}${httpConfig.basePath}`,
+			);
+			if (!settled) {
+				settled = true;
+				resolve();
+			}
+		});
+
+		server.on("close", () => {
+			activeHttpServer = null;
+		});
+	});
+}
+
+function setCorsHeaders(res: http.ServerResponse) {
+	if (httpConfig.corsOrigin) {
+		res.setHeader("Access-Control-Allow-Origin", httpConfig.corsOrigin);
+	}
+	res.setHeader("Access-Control-Allow-Headers", "content-type, x-session-id");
+	res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+	res.setHeader("Access-Control-Allow-Credentials", "false");
+}
+
+function parseCliArgs(argv: string[]): CliArgs {
+	const parsed: CliArgs = {};
+	for (let i = 0; i < argv.length; i += 1) {
+		const arg = argv[i];
+		if (!arg.startsWith("--")) {
+			continue;
+		}
+		const withoutPrefix = arg.slice(2);
+		const [key, inlineValue] = withoutPrefix.split("=", 2);
+		if (inlineValue !== undefined) {
+			parsed[key] = inlineValue;
+			continue;
+		}
+		const next = argv[i + 1];
+		if (next && !next.startsWith("--")) {
+			parsed[key] = next;
+			i += 1;
+		} else {
+			parsed[key] = true;
+		}
+	}
+	return parsed;
+}
+
+function resolveServerMode(args: CliArgs): ServerMode {
+	if (isTruthyFlag(args.http)) {
+		return "http";
+	}
+	if (isTruthyFlag(args.stdio)) {
+		return "stdio";
+	}
+	const envTransport = (process.env.MCP_TRANSPORT ?? process.env.MCP_SERVER_TRANSPORT ?? "").toLowerCase();
+	if (envTransport === "http") {
+		return "http";
+	}
+	if (envTransport === "stdio") {
+		return "stdio";
+	}
+	return "stdio";
+}
+
+function resolveHttpConfig(args: CliArgs): HttpServerConfig {
+	const portValue =
+		args.port ??
+		args["http-port"] ??
+		process.env.MCP_HTTP_PORT ??
+		process.env.PORT;
+	const hostValue =
+		args.host ??
+		process.env.MCP_HTTP_HOST ??
+		process.env.HOST;
+	const basePathValue =
+		args["base-path"] ??
+		process.env.MCP_HTTP_BASE_PATH ??
+		"/mcp";
+	const corsValue =
+		args["cors-origin"] ??
+		process.env.MCP_HTTP_CORS ??
+		"*";
+
+	return {
+		host: getStringOption(hostValue, "0.0.0.0"),
+		port: getNumberOption(portValue, 3030),
+		basePath: normalizeBasePath(getStringOption(basePathValue, "/mcp")),
+		corsOrigin: getStringOption(corsValue, "*"),
+	};
+}
+
+function isTruthyFlag(value: unknown): boolean {
+	if (value === undefined) {
+		return false;
+	}
+	if (value === true) {
+		return true;
+	}
+	if (typeof value !== "string") {
+		return false;
+	}
+	const normalized = value.trim().toLowerCase();
+	if (normalized === "") {
+		return true;
+	}
+	return ["1", "true", "yes", "on"].includes(normalized);
+}
+
+function getStringOption(value: unknown, fallback: string): string {
+	return typeof value === "string" && value.trim() !== ""
+		? value
+		: fallback;
+}
+
+function getNumberOption(value: unknown, fallback: number): number {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return value;
+	}
+	if (typeof value === "string") {
+		const parsed = Number.parseInt(value, 10);
+		if (Number.isFinite(parsed)) {
+			return parsed;
+		}
+	}
+	return fallback;
+}
+
+function normalizeBasePath(rawPath: string): string {
+	if (!rawPath || rawPath === "/") {
+		return "/";
+	}
+	let normalized = rawPath.trim();
+	if (!normalized.startsWith("/")) {
+		normalized = `/${normalized}`;
+	}
+	if (normalized.length > 1 && normalized.endsWith("/")) {
+		normalized = normalized.slice(0, -1);
+	}
+	return normalized;
 }
 
 // Helper functions for argument type checking

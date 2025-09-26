@@ -29,7 +29,9 @@
 		"mcp_config": {
 			"command": "node",
 			"args": ["${__dirname}/dist/index.js"],
-			"env": {}
+			"env": {
+				"MCP_TRANSPORT": "stdio"
+			}
 		}
 	},
 	"tools": [

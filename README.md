@@ -156,6 +156,26 @@ bun run index.ts
 
 Now go forth and automate your digital life! 🚀
 
+## 🌐 Run as HTTP MCP Server
+
+- Build once with `bun run build` (or keep it live with `bun run index.ts --http`) and start streaming mode via `node dist/index.js --http --host 0.0.0.0 --port 3030`.
+- The process exposes an SSE stream at `GET /mcp/stream` and accepts JSON-RPC messages at `POST /mcp/message?sessionId=...` (the session ID arrives on the stream).
+- Configure runtime details through flags or env vars: `--base-path` / `MCP_HTTP_BASE_PATH` (defaults to `/mcp`), `--cors-origin` / `MCP_HTTP_CORS` (defaults to `*`), `--host` / `MCP_HTTP_HOST`, and `--port` / `MCP_HTTP_PORT`.
+- For ChatGPT (or any MCP web client), publish the server and provide a manifest such as:
+
+```json
+{
+  "name": "apple-mcp-http",
+  "version": "1.0.0",
+  "server": {
+    "type": "web",
+    "url": "https://your-domain.example/mcp/stream"
+  }
+}
+```
+
+Set `MCP_TRANSPORT=http` if you want HTTP mode to be the default when launching without CLI flags.
+
 ---
 
 _Made with ❤️ by supermemory (and honestly, claude code)_

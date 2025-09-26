@@ -24,8 +24,10 @@
 	},
 	"scripts": {
 		"dev": "bun run index.ts",
+		"dev:http": "bun run index.ts --http",
 		"build": "bun build index.ts --outfile=dist/index.js --target=node --minify",
 		"start": "node dist/index.js",
+		"start:http": "node dist/index.js --http",
 		"prepublishOnly": "bun run build",
 		"test": "bun run test-runner.ts all",
 		"test:watch": "bun test tests/**/*.test.ts --preload ./tests/setup.ts --watch",
