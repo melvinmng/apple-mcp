@@ -16,6 +16,70 @@ const CONFIG = {
 
 const APPLESCRIPT_TIMEOUT_SECONDS = Math.max(1, Math.ceil(CONFIG.TIMEOUT_MS / 1000));
 
+const MESSAGE_HELPERS = `
+on sortMessagesDescending(messageList)
+	try
+		set sortedMessages to sort messageList by date sent
+		set reversedList to {}
+		set totalCount to count of sortedMessages
+		repeat with i from totalCount to 1 by -1
+			set end of reversedList to item i of sortedMessages
+		end repeat
+		return reversedList
+	on error
+		return messageList
+	end try
+end sortMessagesDescending
+
+on buildMessageRecord(currentMsg, mailboxNameValue)
+	set emailSubject to ""
+	try
+		set emailSubject to subject of currentMsg as string
+	on error
+		set emailSubject to "(No subject)"
+	end try
+
+	set emailSender to ""
+	try
+		set emailSender to sender of currentMsg as string
+	on error
+		set emailSender to "Unknown sender"
+	end try
+
+	set emailDate to ""
+	try
+		set emailDate to (date sent of currentMsg) as string
+	on error
+		try
+			set emailDate to (date received of currentMsg) as string
+		on error
+			set emailDate to ""
+		end try
+	end try
+
+	set emailContent to "[Content not available]"
+	try
+		set fullContent to content of currentMsg as string
+		if (length of fullContent) > ${CONFIG.MAX_CONTENT_PREVIEW} then
+			set emailContent to (text 1 thru ${CONFIG.MAX_CONTENT_PREVIEW} of fullContent) & "..."
+		else
+			set emailContent to fullContent
+		end if
+	on error
+		set emailContent to "[Content not available]"
+	end try
+
+	set isMessageRead to false
+	try
+		set isMessageRead to read status of currentMsg as boolean
+	on error
+		set isMessageRead to false
+	end try
+
+	return {subject:emailSubject, sender:emailSender, dateSent:emailDate, content:emailContent, isRead:isMessageRead, mailbox:mailboxNameValue}
+end buildMessageRecord
+`;
+
 interface EmailMessage {
 	subject: string;
 	sender: string;
@@ -60,6 +124,18 @@ function coerceString(value: unknown, fallback = ""): string {
 	return String(value);
 }
 
+function toIsoDate(value: unknown): string {
+	const asString = coerceString(value);
+	if (!asString) {
+		return new Date().toISOString();
+	}
+	const parsed = Date.parse(asString);
+	if (Number.isNaN(parsed)) {
+		return asString;
+	}
+	return new Date(parsed).toISOString();
+}
+
 function mapEmailRecords(raw: unknown, fallbackMailbox?: string): EmailMessage[] {
 	if (!Array.isArray(raw)) {
 		return [];
@@ -73,9 +149,8 @@ function mapEmailRecords(raw: unknown, fallbackMailbox?: string): EmailMessage[]
 			const subject = coerceString(record.subject, "No subject");
 			const sender = coerceString(record.sender, "Unknown sender");
 			const content = coerceString(record.content, "[Content not available]");
-			const dateSent = coerceString(
-				record.dateSent ?? record.date ?? record.sentDate,
-				new Date().toString(),
+			const dateSent = toIsoDate(
+				record.dateSent ?? record.date ?? record.sentDate ?? record.receivedDate,
 			);
 			const mailbox = coerceString(record.mailbox ?? fallbackMailbox ?? "Unknown mailbox");
 			const isRead = coerceBoolean(record.isRead, !!record.read);
@@ -90,6 +165,13 @@ function mapEmailRecords(raw: unknown, fallbackMailbox?: string): EmailMessage[]
 			};
 		})
 		.filter((email) => email.subject || email.sender);
+}
+
+async function ensureMailAccess(): Promise<void> {
+	const accessResult = await requestMailAccess();
+	if (!accessResult.hasAccess) {
+		throw new Error(accessResult.message);
+	}
 }
 
 /**
@@ -144,59 +226,44 @@ async function requestMailAccess(): Promise<{ hasAccess: boolean; message: strin
  */
 async function getUnreadMails(limit = 10): Promise<EmailMessage[]> {
 	try {
-		const accessResult = await requestMailAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
-
+		await ensureMailAccess();
 		const maxEmails = Math.min(limit, CONFIG.MAX_EMAILS);
+		if (maxEmails <= 0) {
+			return [];
+		}
 
 		const script = `
 with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
-	    tell application "Mail"
-        set emailList to {}
-        set emailCount to 0
+	tell application "Mail"
+		set emailList to {}
+		set emailCount to 0
+		set desiredLimit to ${maxEmails}
 
-        repeat with currentMailbox in mailboxes
-            if emailCount >= ${maxEmails} then exit repeat
-            try
-                set unreadMessages to (messages of currentMailbox whose read status is false)
-                set messageLimit to ${maxEmails}
-                if (count of unreadMessages) < messageLimit then
-                    set messageLimit to count of unreadMessages
-                end if
+		repeat with currentAccount in accounts
+			if emailCount >= desiredLimit then exit repeat
+			try
+				set inboxMailbox to inbox of currentAccount
+				set unreadMessages to (messages of inboxMailbox whose read status is false)
+				set sortedMessages to my sortMessagesDescending(unreadMessages)
+				repeat with currentMsg in sortedMessages
+					if emailCount >= desiredLimit then exit repeat
+					try
+						set recordData to my buildMessageRecord(currentMsg, name of inboxMailbox as string)
+						set emailCount to emailCount + 1
+						set end of emailList to recordData
+					on error
+						-- Skip messages we cannot read
+					end try
+				end repeat
+			on error
+				-- Skip accounts we cannot read
+			end try
+		end repeat
 
-                repeat with messageIndex from 1 to messageLimit
-                    if emailCount >= ${maxEmails} then exit repeat
-                    try
-                        set currentMsg to item messageIndex of unreadMessages
-                        set emailSubject to subject of currentMsg as string
-                        set emailSender to sender of currentMsg as string
-                        set emailDate to (date sent of currentMsg) as string
-                        set emailMailbox to name of currentMailbox as string
-
-                        set emailContent to ""
-                        try
-                            set fullContent to content of currentMsg as string
-                            if (length of fullContent) > ${CONFIG.MAX_CONTENT_PREVIEW} then
-                                set emailContent to (text 1 thru ${CONFIG.MAX_CONTENT_PREVIEW} of fullContent) & "..."
-                            else
-                                set emailContent to fullContent
-                            end if
-                        on error
-                            set emailContent to "[Content not available]"
-                        end try
-
-                        set end of emailList to {subject:emailSubject, sender:emailSender, dateSent:emailDate, content:emailContent, isRead:false, mailbox:emailMailbox}
-                        set emailCount to emailCount + 1
-                    end try
-                end repeat
-            end try
-        end repeat
-
-        return emailList
-    end tell
-end timeout`;
+		return emailList
+	end tell
+end timeout
+${MESSAGE_HELPERS}`;
 
 		const rawResult = await runAppleScript(script);
 		return mapEmailRecords(rawResult);
@@ -216,64 +283,64 @@ async function searchMails(
 	limit = 10,
 ): Promise<EmailMessage[]> {
 	try {
-		const accessResult = await requestMailAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
+		await ensureMailAccess();
 
 		if (!searchTerm || searchTerm.trim() === "") {
 			return [];
 		}
 
 		const maxEmails = Math.min(limit, CONFIG.MAX_EMAILS);
-		const cleanSearchTerm = searchTerm.toLowerCase();
+		const cleanSearchTerm = searchTerm.trim();
 
 		const script = `
 with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
-	    tell application "Mail"
-        set emailList to {}
-        set emailCount to 0
-        set searchTerm to ${toAppleScriptString(cleanSearchTerm)}
+	tell application "Mail"
+		set emailList to {}
+		set emailCount to 0
+		set desiredLimit to ${maxEmails}
+		set searchValue to ${toAppleScriptString(cleanSearchTerm)}
+		set searchLower to do shell script "echo " & quoted form of searchValue & " | tr '[:upper:]' '[:lower:]'"
 
-        repeat with currentMailbox in mailboxes
-            if emailCount >= ${maxEmails} then exit repeat
-            try
-                set allMessages to messages of currentMailbox
-                repeat with currentMsg in allMessages
-                    if emailCount >= ${maxEmails} then exit repeat
-                    try
-                        set emailSubject to subject of currentMsg as string
-                        set emailSender to sender of currentMsg as string
-                        set emailDate to (date sent of currentMsg) as string
-                        set emailMailbox to name of currentMailbox as string
+		repeat with currentAccount in accounts
+			if emailCount >= desiredLimit then exit repeat
+			try
+				set inboxMailbox to inbox of currentAccount
+				set allMessages to messages of inboxMailbox
+				set sortedMessages to my sortMessagesDescending(allMessages)
+				repeat with currentMsg in sortedMessages
+					if emailCount >= desiredLimit then exit repeat
+					try
+						set combinedText to ""
+						try
+							set combinedText to subject of currentMsg as string
+						on error
+							set combinedText to ""
+						end try
+						try
+							set combinedText to combinedText & " " & (content of currentMsg as string)
+						on error
+							-- Ignore content fetch errors for filtering
+						end try
 
-                        set emailContent to ""
-                        try
-                            set fullContent to content of currentMsg as string
-                            if (length of fullContent) > ${CONFIG.MAX_CONTENT_PREVIEW} then
-                                set emailContent to (text 1 thru ${CONFIG.MAX_CONTENT_PREVIEW} of fullContent) & "..."
-                            else
-                                set emailContent to fullContent
-                            end if
-                        on error
-                            set emailContent to "[Content not available]"
-                        end try
+						set combinedLower to do shell script "echo " & quoted form of combinedText & " | tr '[:upper:]' '[:lower:]'"
+						if combinedLower contains searchLower then
+							set recordData to my buildMessageRecord(currentMsg, name of inboxMailbox as string)
+							set end of emailList to recordData
+							set emailCount to emailCount + 1
+						end if
+					on error
+						-- Skip messages we cannot inspect
+					end try
+				end repeat
+			on error
+				-- Skip accounts without inbox access
+			end try
+		end repeat
 
-                        ignoring case
-                            if emailSubject contains searchTerm or emailContent contains searchTerm then
-                                set emailRead to read status of currentMsg as boolean
-                                set end of emailList to {subject:emailSubject, sender:emailSender, dateSent:emailDate, content:emailContent, isRead:emailRead, mailbox:emailMailbox}
-                                set emailCount to emailCount + 1
-                            end if
-                        end ignoring
-                    end try
-                end repeat
-            end try
-        end repeat
-
-        return emailList
-    end tell
-end timeout`;
+		return emailList
+	end tell
+end timeout
+${MESSAGE_HELPERS}`;
 
 		const rawResult = await runAppleScript(script);
 		return mapEmailRecords(rawResult);
@@ -455,7 +522,8 @@ async function getMailboxesForAccount(accountName: string): Promise<string[]> {
 		}
 
 		const script = `
-tell application "Mail"
+with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
+	tell application "Mail"
     set boxList to {}
 
     try
@@ -478,7 +546,8 @@ tell application "Mail"
     end try
 
     return boxList
-end tell`;
+end tell
+end timeout`;
 
 		const result = await runAppleScript(script);
 		if (!Array.isArray(result)) {
@@ -502,69 +571,58 @@ async function getLatestMails(
 	limit = 5,
 ): Promise<EmailMessage[]> {
 	try {
-		const accessResult = await requestMailAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
+		await ensureMailAccess();
+		if (!account || !account.trim()) {
+			return [];
 		}
 
+		const sanitizedAccount = account.replace(/"/g, '\\"');
+		const desiredLimit = Math.min(Math.max(limit, 1), CONFIG.MAX_EMAILS);
+
 		const script = `
-tell application "Mail"
-    set resultList to {}
-    try
-        set targetAccount to first account whose name is "${account.replace(/"/g, '\\"')}"
-        set acctMailboxes to every mailbox of targetAccount
+with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
+	tell application "Mail"
+		set resultList to {}
+		try
+			set targetAccount to first account whose name is "${sanitizedAccount}"
+		on error errMsg
+			return {status:"error", reason:errMsg}
+		end try
 
-        repeat with mb in acctMailboxes
-            try
-                set messagesList to (messages of mb)
-                set sortedMessages to my sortMessagesByDate(messagesList)
-                set msgLimit to ${limit}
-                if (count of sortedMessages) < msgLimit then
-                    set msgLimit to (count of sortedMessages)
-                end if
+		try
+			set inboxMailbox to inbox of targetAccount
+		on error errMsg
+			return {status:"error", reason:errMsg}
+		end try
 
-                repeat with i from 1 to msgLimit
-                    try
-                        set currentMsg to item i of sortedMessages
-                        set msgData to {subject:(subject of currentMsg), sender:(sender of currentMsg), ¬
-                                    date:(date sent of currentMsg) as string, mailbox:(name of mb)}
+		set sortedMessages to my sortMessagesDescending(messages of inboxMailbox)
+		set msgLimit to ${desiredLimit}
+		if (count of sortedMessages) < msgLimit then
+			set msgLimit to count of sortedMessages
+		end if
 
-                        try
-                            set msgContent to content of currentMsg
-                            if length of msgContent > 500 then
-                                set msgContent to (text 1 thru 500 of msgContent) & "..."
-                            end if
-                            set msgData to msgData & {content:msgContent}
-                        on error
-                            set msgData to msgData & {content:"[Content not available]"}
-                        end try
+		repeat with i from 1 to msgLimit
+			try
+				set currentMsg to item i of sortedMessages
+				set recordData to my buildMessageRecord(currentMsg, name of inboxMailbox as string)
+				set end of resultList to recordData
+			on error
+				-- Skip messages we cannot inspect
+			end try
+		end repeat
 
-                        set end of resultList to msgData
-                    on error
-                        -- Skip problematic messages
-                    end try
-                end repeat
-
-                if (count of resultList) >= ${limit} then exit repeat
-            on error
-                -- Skip problematic mailboxes
-            end try
-        end repeat
-    on error errMsg
-        return "Error: " & errMsg
-    end try
-
-    return resultList
-end tell
-
-on sortMessagesByDate(messagesList)
-    set sortedMessages to sort messagesList by date sent
-    return sortedMessages
-end sortMessagesByDate`;
+		return resultList
+	end tell
+end timeout
+${MESSAGE_HELPERS}`;
 
 		const rawResult = await runAppleScript(script);
-		if (typeof rawResult === "string" && rawResult.startsWith("Error:")) {
-			throw new Error(rawResult);
+		if (rawResult && typeof rawResult === "object" && !Array.isArray(rawResult)) {
+			const status = coerceString((rawResult as AppleScriptRecord).status);
+			if (status === "error") {
+				const reason = coerceString((rawResult as AppleScriptRecord).reason);
+				throw new Error(reason || "Failed to read account inbox");
+			}
 		}
 
 		return mapEmailRecords(rawResult, account);

@@ -1,16 +1,15 @@
 import { runAppleScript } from "run-applescript";
 
-// Configuration
 const CONFIG = {
-	// Maximum reminders to process (to avoid performance issues)
 	MAX_REMINDERS: 50,
-	// Maximum lists to process
 	MAX_LISTS: 20,
-	// Timeout for operations
 	TIMEOUT_MS: 8000,
 };
 
-// Define types for our reminders
+const APPLESCRIPT_TIMEOUT_SECONDS = Math.max(1, Math.ceil(CONFIG.TIMEOUT_MS / 1000));
+
+type AppleScriptRecord = Record<string, unknown>;
+
 interface ReminderList {
 	name: string;
 	id: string;
@@ -30,15 +29,381 @@ interface Reminder {
 	priority?: number;
 }
 
-/**
- * Check if Reminders app is accessible
- */
+interface OpenReminderResult {
+	success: boolean;
+	message: string;
+	reminder?: Reminder;
+}
+
+const REMINDER_RECORD_HANDLER = `
+on buildReminderRecord(reminderItem, listNameValue)
+	set reminderName to ""
+	try
+		set reminderName to name of reminderItem as string
+	end try
+
+	set reminderBody to ""
+	try
+		set reminderBody to body of reminderItem as string
+	on error
+		set reminderBody to ""
+	end try
+
+	set reminderId to ""
+	try
+		set reminderId to id of reminderItem as string
+	end try
+
+	set reminderCompleted to false
+	try
+		set reminderCompleted to completed of reminderItem as boolean
+	end try
+
+	set dueString to ""
+	try
+		set dueValue to due date of reminderItem
+		if dueValue is not missing value then
+			set dueString to dueValue as string
+		end if
+	on error
+		set dueString to ""
+	end try
+
+	set completionString to ""
+	try
+		set completionValue to completion date of reminderItem
+		if completionValue is not missing value then
+			set completionString to completionValue as string
+		end if
+	on error
+		set completionString to ""
+	end try
+
+	set creationString to ""
+	try
+		set creationValue to creation date of reminderItem
+		if creationValue is not missing value then
+			set creationString to creationValue as string
+		end if
+	on error
+		set creationString to ""
+	end try
+
+	set modificationString to ""
+	try
+		set modificationValue to modification date of reminderItem
+		if modificationValue is not missing value then
+			set modificationString to modificationValue as string
+		end if
+	on error
+		set modificationString to ""
+	end try
+
+	set remindMeString to ""
+	try
+		set remindValue to remind me date of reminderItem
+		if remindValue is not missing value then
+			set remindMeString to remindValue as string
+		end if
+	on error
+		set remindMeString to ""
+	end try
+
+	set priorityValue to ""
+	try
+		set priorityValue to priority of reminderItem as integer
+	on error
+		set priorityValue to ""
+	end try
+
+	return {name:reminderName, id:reminderId, body:reminderBody, completed:reminderCompleted, listName:listNameValue, dueDate:dueString, completionDate:completionString, creationDate:creationString, modificationDate:modificationString, remindMeDate:remindMeString, priority:priorityValue}
+end buildReminderRecord
+`;
+
+function toAppleScriptString(value: string): string {
+	return JSON.stringify(value ?? "");
+}
+
+function coerceString(value: unknown, fallback = ""): string {
+	if (typeof value === "string") {
+		return value;
+	}
+	if (value === null || value === undefined) {
+		return fallback;
+	}
+	return String(value);
+}
+
+function coerceBoolean(value: unknown, fallback = false): boolean {
+	if (typeof value === "boolean") {
+		return value;
+	}
+	if (typeof value === "string") {
+		const normalized = value.toLowerCase();
+		if (normalized === "true" || normalized === "yes") {
+			return true;
+		}
+		if (normalized === "false" || normalized === "no") {
+			return false;
+		}
+	}
+	if (typeof value === "number") {
+		return value !== 0;
+	}
+	return fallback;
+}
+
+function coerceNumber(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) {
+		return value;
+	}
+	if (typeof value === "string" && value.trim() !== "") {
+		const parsed = Number(value);
+		if (!Number.isNaN(parsed)) {
+			return parsed;
+		}
+	}
+	return undefined;
+}
+
+function toIsoString(value: unknown): string | null {
+	if (!value) {
+		return null;
+	}
+	if (value instanceof Date && !Number.isNaN(value.getTime())) {
+		return value.toISOString();
+	}
+	const asString = coerceString(value);
+	if (!asString) {
+		return null;
+	}
+	const parsed = Date.parse(asString);
+	if (Number.isNaN(parsed)) {
+		return null;
+	}
+	return new Date(parsed).toISOString();
+}
+
+function mapReminderRecords(raw: unknown, fallbackListName?: string): Reminder[] {
+	if (!Array.isArray(raw)) {
+		const single = raw && typeof raw === "object" ? [raw] : [];
+		return mapReminderRecords(single, fallbackListName);
+	}
+
+	return raw
+		.filter((item): item is AppleScriptRecord => item !== null && typeof item === "object")
+		.map((record) => {
+			const name = coerceString(record.name, "Untitled Reminder");
+			const id = coerceString(record.id, "");
+			const body = coerceString(record.body, "");
+			const completed = coerceBoolean(record.completed);
+			const dueDate = toIsoString(record.dueDate);
+			const listName = coerceString(record.listName, fallbackListName || "Reminders");
+			const completionDate = toIsoString(record.completionDate);
+			const creationDate = toIsoString(record.creationDate);
+			const modificationDate = toIsoString(record.modificationDate);
+			const remindMeDate = toIsoString(record.remindMeDate);
+			const priority = coerceNumber(record.priority);
+
+			return {
+				name,
+				id,
+				body,
+				completed,
+				dueDate,
+				listName,
+				completionDate: completionDate ?? undefined,
+				creationDate: creationDate ?? undefined,
+				modificationDate: modificationDate ?? undefined,
+				remindMeDate: remindMeDate ?? undefined,
+				priority,
+			};
+		})
+		.filter((reminder) => reminder.id || reminder.name);
+}
+
+async function ensureRemindersAccess(): Promise<void> {
+	const accessResult = await requestRemindersAccess();
+	if (!accessResult.hasAccess) {
+		throw new Error(accessResult.message);
+	}
+}
+
+type ReminderFetchOptions = {
+	listName?: string;
+	listId?: string;
+	searchText?: string;
+	maxReminders?: number;
+};
+
+async function fetchReminders({
+	listName,
+	listId,
+	searchText,
+	maxReminders = CONFIG.MAX_REMINDERS,
+}: ReminderFetchOptions): Promise<Reminder[]> {
+	await ensureRemindersAccess();
+
+	const sanitizedListName = listName?.trim();
+	const sanitizedListId = listId?.trim();
+	const sanitizedSearch = searchText?.trim();
+	const cappedLimit = Math.max(1, Math.min(maxReminders, CONFIG.MAX_REMINDERS));
+
+	const hasSearch = Boolean(sanitizedSearch);
+	const hasListId = Boolean(sanitizedListId);
+	const hasListName = Boolean(sanitizedListName);
+
+	const script = `
+with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
+	tell application "Reminders"
+		set reminderList to {}
+		set reminderCount to 0
+		set maxReminders to ${cappedLimit}
+		set processedLists to 0
+		set searchMode to ${hasSearch ? "true" : "false"}
+		set searchLower to ""
+
+		if searchMode then
+			set searchNeedle to ${hasSearch ? toAppleScriptString(sanitizedSearch!) : "\"\""}
+			set searchLower to do shell script "echo " & quoted form of searchNeedle & " | tr '[:upper:]' '[:lower:]'"
+		end if
+
+		set candidateLists to {}
+		${hasListId
+			? `set desiredId to ${toAppleScriptString(sanitizedListId!)}
+		repeat with candidate in lists
+			try
+				if (id of candidate as string) is desiredId then
+					set candidateLists to {candidate}
+					exit repeat
+				end if
+			on error
+				-- Ignore lookup errors
+			end try
+		end repeat`
+			: hasListName
+				? `set desiredName to ${toAppleScriptString(sanitizedListName!)}
+		set desiredLower to do shell script "echo " & quoted form of desiredName & " | tr '[:upper:]' '[:lower:]'"
+		repeat with candidate in lists
+			try
+				set candidateLower to do shell script "echo " & quoted form of (name of candidate as string) & " | tr '[:upper:]' '[:lower:]'"
+				if candidateLower contains desiredLower or desiredLower contains candidateLower then
+					set candidateLists to {candidate}
+					exit repeat
+				end if
+			on error
+				-- Ignore lookup errors
+			end try
+		end repeat`
+				: "set candidateLists to lists"}
+
+		if (count of candidateLists) is 0 then
+			return {status:"error", reason:"list_not_found"}
+		end if
+
+		repeat with currentList in candidateLists
+			if reminderCount >= maxReminders then exit repeat
+			if processedLists >= ${CONFIG.MAX_LISTS} then exit repeat
+			set processedLists to processedLists + 1
+			try
+				set listNameValue to name of currentList as string
+				set reminderItems to reminders of currentList
+				repeat with reminderItem in reminderItems
+					if reminderCount >= maxReminders then exit repeat
+					try
+						set includeReminder to true
+						if searchMode then
+							set combinedText to ""
+							try
+								set combinedText to name of reminderItem as string
+							end try
+							try
+								set combinedText to combinedText & " " & (body of reminderItem as string)
+							on error
+								-- Ignore body errors
+							end try
+							set combinedLower to do shell script "echo " & quoted form of combinedText & " | tr '[:upper:]' '[:lower:]'"
+							if combinedLower does not contain searchLower then
+								set includeReminder to false
+							end if
+						end if
+
+						if includeReminder then
+							set reminderRecord to my buildReminderRecord(reminderItem, listNameValue)
+							set end of reminderList to reminderRecord
+							set reminderCount to reminderCount + 1
+						end if
+					on error
+						-- Ignore reminder level errors
+					end try
+				end repeat
+			on error
+				-- Ignore list level errors
+			end try
+		end repeat
+
+		return reminderList
+	end tell
+end timeout
+${REMINDER_RECORD_HANDLER}`;
+
+	const rawResult = await runAppleScript(script);
+
+	if (rawResult && typeof rawResult === "object" && !Array.isArray(rawResult)) {
+		const status = coerceString((rawResult as AppleScriptRecord).status);
+		if (status === "error") {
+			const reason = coerceString((rawResult as AppleScriptRecord).reason);
+			if (reason === "list_not_found") {
+				throw new Error("Could not find the specified reminders list.");
+			}
+			throw new Error(reason || "An unknown Reminders error occurred.");
+		}
+	}
+
+	return mapReminderRecords(rawResult, sanitizedListName);
+}
+
+async function showReminderById(reminderId: string): Promise<{ success: boolean; message: string }> {
+	const script = `
+with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
+	tell application "Reminders"
+		try
+			set targetReminder to first reminder whose id is ${toAppleScriptString(reminderId)}
+		on error errMsg
+			return "ERROR:" & errMsg
+		end try
+
+		try
+			show targetReminder
+		on error
+			try
+				set parentList to container of targetReminder
+				show parentList
+			on error
+				-- Best effort
+			end try
+		end try
+
+		activate
+		return "SUCCESS"
+	end tell
+end timeout`;
+
+	const result = await runAppleScript(script);
+	if (typeof result === "string" && result.startsWith("ERROR:")) {
+		return { success: false, message: result.replace("ERROR:", "").trim() || "Failed to open reminder." };
+	}
+	return { success: true, message: "Reminders app opened." };
+}
+
 async function checkRemindersAccess(): Promise<boolean> {
 	try {
 		const script = `
-tell application "Reminders"
-    return name
-end tell`;
+with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
+	tell application "Reminders"
+		return name
+	end tell
+end timeout`;
 
 		await runAppleScript(script);
 		return true;
@@ -50,80 +415,66 @@ end tell`;
 	}
 }
 
-/**
- * Request Reminders app access and provide instructions if not available
- */
 async function requestRemindersAccess(): Promise<{ hasAccess: boolean; message: string }> {
 	try {
-		// First check if we already have access
 		const hasAccess = await checkRemindersAccess();
 		if (hasAccess) {
 			return {
 				hasAccess: true,
-				message: "Reminders access is already granted."
+				message: "Reminders access is already granted.",
 			};
 		}
 
-		// If no access, provide clear instructions
 		return {
 			hasAccess: false,
-			message: "Reminders access is required but not granted. Please:\n1. Open System Settings > Privacy & Security > Automation\n2. Find your terminal/app in the list and enable 'Reminders'\n3. Restart your terminal and try again\n4. If the option is not available, run this command again to trigger the permission dialog"
+			message:
+				"Reminders access is required but not granted. Please:\n1. Open System Settings > Privacy & Security > Automation\n2. Enable 'Reminders' for your terminal/app\n3. Restart your terminal and try again",
 		};
 	} catch (error) {
 		return {
 			hasAccess: false,
-			message: `Error checking Reminders access: ${error instanceof Error ? error.message : String(error)}`
+			message: `Error checking Reminders access: ${error instanceof Error ? error.message : String(error)}`,
 		};
 	}
 }
 
-/**
- * Get all reminder lists (limited for performance)
- * @returns Array of reminder lists with their names and IDs
- */
 async function getAllLists(): Promise<ReminderList[]> {
 	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
+		await ensureRemindersAccess();
 
 		const script = `
-tell application "Reminders"
-    set listArray to {}
-    set listCount to 0
+with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
+	tell application "Reminders"
+		set listArray to {}
+		set listCount to 0
+		set allLists to lists
 
-    -- Get all lists
-    set allLists to lists
+		repeat with currentList in allLists
+			if listCount >= ${CONFIG.MAX_LISTS} then exit repeat
+			try
+				set listName to name of currentList as string
+				set listId to id of currentList as string
+				set end of listArray to {name:listName, id:listId}
+				set listCount to listCount + 1
+			on error
+				-- Ignore lists we cannot read
+			end try
+		end repeat
 
-    repeat with i from 1 to (count of allLists)
-        if listCount >= ${CONFIG.MAX_LISTS} then exit repeat
+		return listArray
+	end tell
+end timeout`;
 
-        try
-            set currentList to item i of allLists
-            set listName to name of currentList
-            set listId to id of currentList
-
-            set listInfo to {name:listName, id:listId}
-            set listArray to listArray & {listInfo}
-            set listCount to listCount + 1
-        on error
-            -- Skip problematic lists
-        end try
-    end repeat
-
-    return listArray
-end tell`;
-
-		const result = (await runAppleScript(script)) as any;
-
-		// Convert AppleScript result to our format
+		const result = await runAppleScript(script);
 		const resultArray = Array.isArray(result) ? result : result ? [result] : [];
 
-		return resultArray.map((listData: any) => ({
-			name: listData.name || "Untitled List",
-			id: listData.id || "unknown-id",
-		}));
+		return resultArray
+			.filter((list): list is AppleScriptRecord => list !== null && typeof list === "object")
+			.map((list) => ({
+				name: coerceString(list.name, "Untitled List"),
+				id: coerceString(list.id, ""),
+			}))
+			.filter((list) => Boolean(list.id || list.name));
 	} catch (error) {
 		console.error(
 			`Error getting reminder lists: ${error instanceof Error ? error.message : String(error)}`,
@@ -132,205 +483,128 @@ end tell`;
 	}
 }
 
-/**
- * Get all reminders from a specific list or all lists (simplified for performance)
- * @param listName Optional list name to filter by
- * @returns Array of reminders
- */
 async function getAllReminders(listName?: string): Promise<Reminder[]> {
-	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
-
-		const script = `
-tell application "Reminders"
-    try
-        -- Simple check - try to get just the count first to avoid timeouts
-        set listCount to count of lists
-        if listCount > 0 then
-            return "SUCCESS:found_lists_but_reminders_query_too_slow"
-        else
-            return {}
-        end if
-    on error
-        return {}
-    end try
-end tell`;
-
-		const result = (await runAppleScript(script)) as any;
-
-		// For performance reasons, just return empty array with success message
-		// Complex reminder queries are too slow and unreliable
-		if (result && typeof result === "string" && result.includes("SUCCESS")) {
-			return [];
-		}
-
-		return [];
-	} catch (error) {
-		console.error(
-			`Error getting reminders: ${error instanceof Error ? error.message : String(error)}`,
-		);
-		return [];
-	}
+	return fetchReminders({ listName });
 }
 
-/**
- * Search for reminders by text (simplified for performance)
- * @param searchText Text to search for in reminder names or notes
- * @returns Array of matching reminders
- */
 async function searchReminders(searchText: string): Promise<Reminder[]> {
-	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
-
-		if (!searchText || searchText.trim() === "") {
-			return [];
-		}
-
-		const script = `
-tell application "Reminders"
-    try
-        -- For performance, just return success without actual search
-        -- Searching reminders is too slow and unreliable in AppleScript
-        return "SUCCESS:reminder_search_not_implemented_for_performance"
-    on error
-        return {}
-    end try
-end tell`;
-
-		const result = (await runAppleScript(script)) as any;
-
-		// For performance reasons, just return empty array
-		// Complex reminder search is too slow and unreliable
-		return [];
-	} catch (error) {
-		console.error(
-			`Error searching reminders: ${error instanceof Error ? error.message : String(error)}`,
-		);
+	if (!searchText || searchText.trim() === "") {
 		return [];
 	}
+
+	return fetchReminders({ searchText });
 }
 
-/**
- * Create a new reminder (simplified for performance)
- * @param name Name of the reminder
- * @param listName Name of the list to add the reminder to (creates if doesn't exist)
- * @param notes Optional notes for the reminder
- * @param dueDate Optional due date for the reminder (ISO string)
- * @returns The created reminder
- */
 async function createReminder(
 	name: string,
 	listName: string = "Reminders",
 	notes?: string,
 	dueDate?: string,
 ): Promise<Reminder> {
-	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
+	await ensureRemindersAccess();
 
-		// Validate inputs
-		if (!name || name.trim() === "") {
-			throw new Error("Reminder name cannot be empty");
-		}
-
-		const cleanName = name.replace(/\"/g, '\\"');
-		const cleanListName = listName.replace(/\"/g, '\\"');
-		const cleanNotes = notes ? notes.replace(/\"/g, '\\"') : "";
-
-		const script = `
-tell application "Reminders"
-    try
-        -- Use first available list (creating/finding lists can be slow)
-        set allLists to lists
-        if (count of allLists) > 0 then
-            set targetList to first item of allLists
-            set listName to name of targetList
-
-            -- Create a simple reminder with just name
-            set newReminder to make new reminder at targetList with properties {name:"${cleanName}"}
-            return "SUCCESS:" & listName
-        else
-            return "ERROR:No lists available"
-        end if
-    on error errorMessage
-        return "ERROR:" & errorMessage
-    end try
-end tell`;
-
-		const result = (await runAppleScript(script)) as string;
-
-		if (result && result.startsWith("SUCCESS:")) {
-			const actualListName = result.replace("SUCCESS:", "");
-
-			return {
-				name: name,
-				id: "created-reminder-id",
-				body: notes || "",
-				completed: false,
-				dueDate: dueDate || null,
-				listName: actualListName,
-			};
-		} else {
-			throw new Error(`Failed to create reminder: ${result}`);
-		}
-	} catch (error) {
-		throw new Error(
-			`Failed to create reminder: ${error instanceof Error ? error.message : String(error)}`,
-		);
+	if (!name || name.trim() === "") {
+		throw new Error("Reminder name cannot be empty");
 	}
+
+	const trimmedName = name.trim();
+	const trimmedNotes = notes?.trim();
+	const trimmedList = listName?.trim();
+
+	let dueTimestamp: number | null = null;
+	if (dueDate) {
+		const parsedDueDate = new Date(dueDate);
+		if (Number.isNaN(parsedDueDate.getTime())) {
+			throw new Error("Invalid due date format. Please use ISO date strings.");
+		}
+		dueTimestamp = Math.round(parsedDueDate.getTime() / 1000);
+	}
+
+	const script = `
+with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
+	tell application "Reminders"
+		set reminderName to ${toAppleScriptString(trimmedName)}
+		set targetList to missing value
+
+		${trimmedList
+			? `set desiredName to ${toAppleScriptString(trimmedList)}
+		try
+			set targetList to first list whose name is desiredName
+		on error
+			repeat with candidate in lists
+				try
+					if (id of candidate as string) is desiredName then
+						set targetList to candidate
+						exit repeat
+					end if
+				on error
+					-- Ignore lookup errors
+				end try
+			end repeat
+		end try`
+			: ""}
+
+		if targetList is missing value then
+			try
+				set targetList to default list
+			on error
+				set targetList to first list
+			end try
+		end if
+
+		set newReminder to make new reminder at targetList with properties {name:reminderName}
+
+		${trimmedNotes ? `set body of newReminder to ${toAppleScriptString(trimmedNotes)}` : ""}
+
+		${dueTimestamp !== null
+			? `try
+				set desiredTimestamp to ${dueTimestamp}
+				set nowUnix to (do shell script "date +%s") as integer
+				set offsetSeconds to desiredTimestamp - nowUnix
+				set dueDateValue to (current date) + offsetSeconds
+				set due date of newReminder to dueDateValue
+			on error
+				-- Ignore due date failures
+			end try`
+			: ""}
+
+		return my buildReminderRecord(newReminder, name of targetList as string)
+	end tell
+end timeout
+${REMINDER_RECORD_HANDLER}`;
+
+	const rawResult = await runAppleScript(script);
+	const reminders = mapReminderRecords(rawResult, trimmedList);
+	if (reminders.length === 0) {
+		throw new Error("Failed to create reminder.");
+	}
+
+	return reminders[0];
 }
 
-interface OpenReminderResult {
-	success: boolean;
-	message: string;
-	reminder?: Reminder;
-}
-
-/**
- * Open the Reminders app and show a specific reminder (simplified)
- * @param searchText Text to search for in reminder names or notes
- * @returns Result of the operation
- */
 async function openReminder(searchText: string): Promise<OpenReminderResult> {
 	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			return { success: false, message: accessResult.message };
+		if (!searchText || searchText.trim() === "") {
+			return { success: false, message: "Search text cannot be empty." };
 		}
 
-		// First search for the reminder
-		const matchingReminders = await searchReminders(searchText);
-
-		if (matchingReminders.length === 0) {
-			return { success: false, message: "No matching reminders found" };
+		const reminders = await fetchReminders({ searchText, maxReminders: CONFIG.MAX_REMINDERS });
+		if (reminders.length === 0) {
+			return { success: false, message: "No matching reminders found." };
 		}
 
-		// Open the Reminders app
-		const script = `
-tell application "Reminders"
-    activate
-    return "SUCCESS"
-end tell`;
+		const reminder = reminders[0];
+		const openResult = await showReminderById(reminder.id);
 
-		const result = (await runAppleScript(script)) as string;
-
-		if (result === "SUCCESS") {
-			return {
-				success: true,
-				message: "Reminders app opened",
-				reminder: matchingReminders[0],
-			};
-		} else {
-			return { success: false, message: "Failed to open Reminders app" };
+		if (!openResult.success) {
+			return { success: false, message: openResult.message };
 		}
+
+		return {
+			success: true,
+			message: openResult.message,
+			reminder,
+		};
 	} catch (error) {
 		return {
 			success: false,
@@ -339,44 +613,15 @@ end tell`;
 	}
 }
 
-/**
- * Get reminders from a specific list by ID (simplified for performance)
- * @param listId ID of the list to get reminders from
- * @param props Array of properties to include (optional, ignored for simplicity)
- * @returns Array of reminders with basic properties
- */
 async function getRemindersFromListById(
 	listId: string,
-	props?: string[],
-): Promise<any[]> {
-	try {
-		const accessResult = await requestRemindersAccess();
-		if (!accessResult.hasAccess) {
-			throw new Error(accessResult.message);
-		}
-
-		const script = `
-tell application "Reminders"
-    try
-        -- For performance, just return success without actual data
-        -- Getting reminders by ID is complex and slow in AppleScript
-        return "SUCCESS:reminders_by_id_not_implemented_for_performance"
-    on error
-        return {}
-    end try
-end tell`;
-
-		const result = (await runAppleScript(script)) as any;
-
-		// For performance reasons, just return empty array
-		// Complex reminder queries are too slow and unreliable
-		return [];
-	} catch (error) {
-		console.error(
-			`Error getting reminders from list by ID: ${error instanceof Error ? error.message : String(error)}`,
-		);
+	_props?: string[],
+): Promise<Reminder[]> {
+	if (!listId || listId.trim() === "") {
 		return [];
 	}
+
+	return fetchReminders({ listId });
 }
 
 export default {

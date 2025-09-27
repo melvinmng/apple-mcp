@@ -361,30 +361,39 @@ async function getDirections(
 
         console.error(`getDirections - Getting directions from "${fromAddress}" to "${toAddress}"`);
 
-        const result = await run((args: { 
+		const result = await run((args: { 
             fromAddress: string, 
             toAddress: string, 
             transportType: string 
         }) => {
             try {
+                const app = Application.currentApplication();
+                app.includeStandardAdditions = true;
                 const Maps = Application("Maps");
                 Maps.activate();
-                
-                // Ask for directions
-                Maps.getDirections({
-                    from: args.fromAddress,
-                    to: args.toAddress,
-                    by: args.transportType
-                });
-                
-                // Wait for directions to load
+
+                const params: string[] = [];
+                if (args.fromAddress) {
+                    params.push(`saddr=${encodeURIComponent(args.fromAddress)}`);
+                }
+                params.push(`daddr=${encodeURIComponent(args.toAddress)}`);
+
+                let flag = "d";
+                if (args.transportType === "walking") {
+                    flag = "w";
+                } else if (args.transportType === "transit") {
+                    flag = "r";
+                }
+                params.push(`dirflg=${flag}`);
+
+                const url = `maps://?${params.join("&")}`;
+                app.openLocation(url);
+
                 delay(2);
-                
-                // There's no direct API to get the route details
-                // We'll return basic success and let the Maps UI show the route
+
                 return {
                     success: true,
-                    message: `Displaying directions from "${args.fromAddress}" to "${args.toAddress}" by ${args.transportType}`,
+                    message: `Started navigation from "${args.fromAddress}" to "${args.toAddress}" by ${args.transportType}`,
                     route: {
                         distance: "See Maps app for details",
                         duration: "See Maps app for details",
