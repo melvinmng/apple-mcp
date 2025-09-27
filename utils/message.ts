@@ -95,7 +95,7 @@ with timeout of ${APPLESCRIPT_TIMEOUT_SECONDS} seconds
         try
             set targetBuddy to buddy ${JSON.stringify(sanitizedNumber)} of targetService
         on error
-            set targetBuddy to make new buddy with service targetService with properties {handle:${JSON.stringify(sanitizedNumber)}}
+            set targetBuddy to make new buddy at targetService with properties {handle:${JSON.stringify(sanitizedNumber)}}
         end try
         send ${JSON.stringify(message)} to targetBuddy
     end tell
